@@ -1,0 +1,551 @@
+"""
+Diabetes Digital Twin Sandbox  (Streamlit prototype)
+====================================================
+Run:  pip install streamlit pandas numpy altair
+      streamlit run diabetes_digital_twin.py
+Pipeline
+--------
+1. Synthetic data engine : EHR baseline + 24 h of CGM / steps / carb markers with
+sensor dropouts
+2. Preprocessing         : time-aware interpolation of dropouts + min-max
+normalisation
+3. Digital Twin engine   : Bergman-style minimal model (glucose, remote insulin
+action,
+                           plasma insulin) extended with meal absorption, exercise
+and
+                           drug (Metformin / Empagliflozin) effects, integrated with
+RK4
+4. Dashboard             : metric cards, actual-vs-predicted chart, counterfactual
+XAI panel
+IMPORTANT: Everything here is SYNTHETIC and the model parameters are illustrative,
+not
+clinically validated. This is a research/hackathon prototype, not a medical device.
+"""
+from __future__ import annotations
+from dataclasses import dataclass, replace
+from typing import Dict, List, Tuple
+import altair as alt
+import numpy as np
+import pandas as pd
+import streamlit as st
+# -----------------------------------------------------------------------------------
+---
+# Global constants
+# -----------------------------------------------------------------------------------
+---
+TIR_LOW, TIR_HIGH = 70.0, 180.0     # consensus Time-in-Range band (mg/dL)
+SAMPLE_MIN = 15                     # CGM sampling interval (minutes)
+N_SAMPLES = 24 * 60 // SAMPLE_MIN   # 96 samples = 24 hours
+SIM_MINUTES = 120                   # forecast horizon
+OUT_STEP_MIN = 5                    # resolution of the plotted forecast
+EHR_BASELINE: Dict[str, object] = {
+    "patient_id": "DT-0058",
+    "age": 58,
+    "baseline_hba1c": 8.2,
+    "diagnosis": "Type 2 Diabetes Mellitus",
+    "medications": [
+        {"name": "Metformin", "dose_mg": 1000},
+        {"name": "Empagliflozin", "dose_mg": 10},
+    ],
+}
+# -----------------------------------------------------------------------------------
+---
+# 1. SYNTHETIC DATA ENGINE
+# -----------------------------------------------------------------------------------
+---
+@st.cache_data(show_spinner=False)
+def generate_synthetic_data(seed: int, dropout_rate: float, anchor_iso: str) ->
+pd.DataFrame:
+    """
+    Build a 24 h wearable dataframe (15-min grid) merged with static EHR attributes.
+    Columns: timestamp, glucose_raw (CGM, NaN on dropout), steps_raw (NaN on
+dropout),
+             carbs_g (logged meals), age, baseline_hba1c, metformin_mg,
+empagliflozin_mg
+    """
+    rng = np.random.default_rng(seed)
+    ts = pd.date_range(end=pd.Timestamp(anchor_iso), periods=N_SAMPLES, freq=f"
+{SAMPLE_MIN}min")
+    hour = (ts.hour + ts.minute / 60.0).to_numpy()
+    # --- carbohydrate markers: (clock hour, nominal grams) with small random
+variation
+    meals = [(7.5, 45), (12.5, 60), (15.5, 20), (19.0, 70)]
+    carbs = np.zeros(N_SAMPLES)
+    meal_idx: List[int] = []
+    for h, grams in meals:
+        circ = np.abs(((hour - h) + 12) % 24 - 12)          # circular clock distance
+        i = int(np.argmin(circ))
+        carbs[i] = max(5, round(grams * rng.normal(1.0, 0.1) / 5) * 5)
+        meal_idx.append(i)
+    # --- step counts per 15 min: sleep ~0, awake ~35, brisk post-meal walks
+    awake = (hour >= 7) & (hour <= 22)
+    steps = np.where(awake, rng.poisson(35, N_SAMPLES), rng.poisson(1,
+N_SAMPLES)).astype(float)
+for i in meal_idx[1::2]:                                  # walk after lunch and
+dinner
+        for k in (2, 3):
+            if i + k < N_SAMPLES:
+                steps[i + k] += rng.normal(700, 90)
+    # --- glucose: fasting baseline + dawn phenomenon + meal excursions - walking
+effect + noise
+    glucose = 160 + 12 * np.exp(-((hour - 6.5) ** 2) / (2 * 1.5**2))
+    idx = np.arange(N_SAMPLES)
+    for i in meal_idx:
+        t = (idx - i) * SAMPLE_MIN
+        t = np.where(t >= 0, t, np.nan)
+        kernel = np.nan_to_num((t / 60.0) ** 2 * np.exp(2 * (1 - t / 60.0)))  # peaks
+at 60 min
+        glucose = glucose + 2.3 * carbs[i] * kernel
+    walk_dip = np.zeros(N_SAMPLES)
+    for k in range(N_SAMPLES):
+        walk_dip[k] = np.sum(steps[: k + 1] * 0.02 * np.exp(-(k - np.arange(k + 1)) *
+SAMPLE_MIN / 45.0)
+                             * (steps[: k + 1] > 300))
+    glucose = glucose - walk_dip
+    noise = np.zeros(N_SAMPLES)
+    for k in range(1, N_SAMPLES):                               # AR(1)
+sensor/physiology noise
+        noise[k] = 0.8 * noise[k - 1] + rng.normal(0, 4)
+    glucose = np.clip(glucose + noise, 55, 380).round(1)
+    # --- sensor dropouts: random single losses + one contiguous 4-sample outage
+    g_mask = rng.random(N_SAMPLES) < dropout_rate
+    if dropout_rate > 0:
+        start = int(rng.integers(8, N_SAMPLES - 12))
+        g_mask[start:start + 4] = True
+    g_mask[-1] = False                                          # keep the latest
+reading live
+    s_mask = rng.random(N_SAMPLES) < dropout_rate / 2
+    glucose_raw = np.where(g_mask, np.nan, glucose)
+    steps_raw = np.where(s_mask, np.nan, steps.round())
+    df = pd.DataFrame({
+        "timestamp": ts,
+        "glucose_raw": glucose_raw,
+        "steps_raw": steps_raw,
+        "carbs_g": carbs,
+    })
+    # Merge static EHR attributes so the frame is a single combined record
+    df["age"] = EHR_BASELINE["age"]
+    df["baseline_hba1c"] = EHR_BASELINE["baseline_hba1c"]
+    df["metformin_mg"] = 1000
+    df["empagliflozin_mg"] = 10
+return df
+# -----------------------------------------------------------------------------------
+---
+# 2. PREPROCESSING PIPELINE
+# -----------------------------------------------------------------------------------
+---
+def preprocess(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Tuple[float,
+float]]]:
+    """
+    Impute sensor dropouts and normalise signals.
+    * Glucose : time-weighted linear interpolation (gaps <= 2 h), then ffill/bfill
+for edges
+    * Steps   : linear interpolation, remaining gaps -> 0, clipped at >= 0
+    * Scaling : min-max to [0, 1]; the (min, max) pairs are returned for inverse
+transforms
+    * Flags   : *_imputed columns keep an audit trail of which values were
+reconstructed
+    """
+    out = df.copy()
+    out["glucose_imputed"] = out["glucose_raw"].isna()
+    out["steps_imputed"] = out["steps_raw"].isna()
+    indexed = out.set_index("timestamp")
+    glucose = indexed["glucose_raw"].interpolate(method="time", limit=8,
+limit_direction="both")
+    glucose = glucose.ffill().bfill().clip(40, 400)
+    steps = indexed["steps_raw"].interpolate(method="time",
+limit_direction="both").fillna(0).clip(lower=0)
+    out["glucose"] = glucose.to_numpy()
+    out["steps"] = steps.to_numpy()
+    scalers: Dict[str, Tuple[float, float]] = {}
+    for col in ("glucose", "steps", "carbs_g"):
+        lo, hi = float(out[col].min()), float(out[col].max())
+        scalers[col] = (lo, hi)
+        out[f"{col}_norm"] = 0.0 if hi - lo < 1e-9 else (out[col] - lo) / (hi - lo)
+    return out, scalers
+def glucose_trend(clean: pd.DataFrame) -> Tuple[float, str, str]:
+    """Slope (mg/dL/min) from a linear fit on the last 4 samples, with CGM-style
+arrow."""
+    y = clean["glucose"].to_numpy()[-4:]
+    x = np.arange(len(y)) * SAMPLE_MIN
+    slope = float(np.polyfit(x, y, 1)[0])
+    bands = [(3, "⇈", "Rising rapidly"), (2, "↑", "Rising"), (1, "↗", "Rising
+slowly"),
+             (-1, "→", "Steady"), (-2, "↘", "Falling slowly"), (-3, "↓", "Falling")]
+    for threshold, arrow, label in bands:
+        if slope >= threshold:
+            return slope, arrow, label
+    return slope, "⇊", "Falling rapidly"
+def time_in_range(values: np.ndarray) -> float:
+    """Percentage of readings inside the 70-180 mg/dL band."""
+    values = np.asarray(values, dtype=float)
+    return float(np.mean((values >= TIR_LOW) & (values <= TIR_HIGH)) * 100.0)
+# -----------------------------------------------------------------------------------
+---
+# 3. DIGITAL TWIN ENGINE (Bergman minimal model, extended)
+# -----------------------------------------------------------------------------------
+---
+@dataclass(frozen=True)
+class TwinParams:
+    """
+    State vector: G glucose (mg/dL), x remote insulin action (1/min),
+                  i plasma insulin above basal (uU/mL), E exercise effect (a.u.)
+    dG/dt = -p1 (G - Gb) - x G + Ra(t)/Vg - k_ex E f(G)
+            - k_met dA_met - k_uge max(G - Tr, 0) dA_emp
+    dx/dt = -p2 x + p3 S(t) i
+    di/dt = -n i + gamma max(G - Gb, 0)
+    dE/dt = u_ex(t) - E / tau_ex
+    dA_* is the drug activity relative to the on-schedule baseline, so the patient's
+    medicated fasting level Gb already contains the usual drug effect and only
+    deviations (a skipped dose) move the curve.
+    """
+    Gb: float                 # medicated fasting baseline inferred from CGM (mg/dL)
+    p1: float = 0.012         # insulin-independent glucose effectiveness (1/min)
+    p2: float = 0.020         # decay of remote insulin action (1/min)
+    p3: float = 1.2e-5        # insulin sensitivity (mL/uU/min^2), reduced in T2D
+    n: float = 0.090          # insulin clearance (1/min)
+    gamma: float = 0.025      # blunted pancreatic secretion (uU/mL/min per mg/dL)
+    vg: float = 128.0         # glucose distribution volume (dL)
+    ag: float = 0.70          # effective carbohydrate bioavailability
+    t_max: float = 45.0       # time of peak gut absorption (min)
+    k_ex: float = 0.040       # exercise-driven glucose uptake (mg/dL/min per unit E)
+    tau_ex: float = 40.0      # exercise effect decay (min)
+    k_met: float = 0.250      # Metformin: hepatic glucose output reduction
+(mg/dL/min)
+    s_met: float = 0.300      # Metformin: relative insulin-sensitivity gain
+    k_uge: float = 0.003      # Empagliflozin: urinary glucose excretion slope
+(1/min)
+    renal_thr: float = 110.0  # Empagliflozin-lowered renal threshold (mg/dL)
+    met_ka: float = 0.012     # Metformin absorption rate (1/min)  -> Tmax ~ 3 h
+    met_ke: float = 0.0019    # Metformin elimination rate (1/min) -> t1/2 ~ 6 h
+    emp_ka: float = 0.030     # Empagliflozin absorption rate -> Tmax ~ 2 h
+    emp_ke: float = 0.00096   # Empagliflozin elimination rate -> t1/2 ~ 12 h
+    missed_dose_shift_min: float = 720.0  # a skipped dose falls back to the previous
+(BID) dose
+@dataclass(frozen=True)
+class ScenarioInputs:
+    carbs_g: float = 0.0
+    exercise_min: float = 0.0
+    dose_taken: bool = True
+    hours_since_dose: float = 2.0
+def estimate_params(clean: pd.DataFrame) -> TwinParams:
+    """Data-driven personalisation: fasting baseline = 20th percentile of cleaned
+CGM."""
+    gb = float(np.clip(np.percentile(clean["glucose"], 20), 90, 200))
+    return TwinParams(Gb=gb)
+def drug_activity(age_min: float, ka: float, ke: float) -> float:
+    """Bateman one-compartment oral PK curve, normalised so the peak equals 1."""
+    t = max(age_min, 0.0)
+    t_peak = np.log(ka / ke) / (ka - ke)
+    peak = np.exp(-ke * t_peak) - np.exp(-ka * t_peak)
+    return float((np.exp(-ke * t) - np.exp(-ka * t)) / peak)
+def meal_rate(t_min: float, grams: float, p: TwinParams) -> float:
+    """Gut glucose appearance Ra (mg/min): gamma-shaped absorption curve."""
+    if grams <= 0 or t_min <= 0:
+        return 0.0
+    return p.ag * grams * 1000.0 * t_min * np.exp(-t_min / p.t_max) / p.t_max**2
+def recent_meals(clean: pd.DataFrame, horizon_min: int = 240) -> List[Tuple[float,
+float]]:
+    """Meals logged in the last `horizon_min` minutes as (age_in_minutes, grams)."""
+    now = clean["timestamp"].iloc[-1]
+    recent = clean[(clean["carbs_g"] > 0) & (now - clean["timestamp"] <=
+pd.Timedelta(minutes=horizon_min))]
+    return [((now - r.timestamp).total_seconds() / 60.0, float(r.carbs_g)) for r in
+recent.itertuples()]
+def _derivatives(t: float, s: np.ndarray, p: TwinParams, sc: ScenarioInputs,
+                 meals: List[Tuple[float, float]]) -> np.ndarray:
+    G, x, i, E = s
+    # Gut absorption: residual tails of earlier meals + the new meal at t = 0
+    ra = sum(meal_rate(t + age, g, p) for age, g in meals) + meal_rate(t, sc.carbs_g,
+p)
+    # Drug activity relative to the on-schedule baseline (taken at hours_since_dose
+ago)
+    age_base = sc.hours_since_dose * 60.0 + t
+    age_scn = age_base + (0.0 if sc.dose_taken else p.missed_dose_shift_min)
+    d_met = drug_activity(age_scn, p.met_ka, p.met_ke) - drug_activity(age_base,
+p.met_ka, p.met_ke)
+    d_emp = drug_activity(age_scn, p.emp_ka, p.emp_ke) - drug_activity(age_base,
+p.emp_ka, p.emp_ke)
+    ex_on = 1.0 if t < sc.exercise_min else 0.0
+    sens = float(np.clip(1.0 + p.s_met * d_met + 0.01 * E, 0.3, 2.0))
+    uptake = p.k_ex * E * float(np.clip(G / 180.0, 0.5, 1.3))   # weaker uptake when
+glucose is low
+    dG = (-p.p1 * (G - p.Gb) - x * G + ra / p.vg - uptake
+          - p.k_met * d_met - p.k_uge * max(G - p.renal_thr, 0.0) * d_emp)
+    dx = -p.p2 * x + p.p3 * sens * i
+    di = -p.n * i + p.gamma * max(G - p.Gb, 0.0)
+    dE = ex_on - E / p.tau_ex
+    return np.array([dG, dx, di, dE])
+def simulate(g0: float, p: TwinParams, sc: ScenarioInputs,
+             meals: List[Tuple[float, float]]) -> pd.DataFrame:
+    """RK4 integration (1-min step) -> DataFrame[minute, glucose] at OUT_STEP_MIN
+resolution."""
+    # Start from a quasi-steady insulin state consistent with the current glucose
+level
+    i0 = p.gamma * max(g0 - p.Gb, 0.0) / p.n
+    state = np.array([g0, p.p3 * i0 / p.p2, i0, 0.0])
+    dt = 1.0
+    traj = [state[0]]
+    for k in range(SIM_MINUTES):
+        t = k * dt
+        k1 = _derivatives(t, state, p, sc, meals)
+        k2 = _derivatives(t + dt / 2, state + dt / 2 * k1, p, sc, meals)
+        k3 = _derivatives(t + dt / 2, state + dt / 2 * k2, p, sc, meals)
+        k4 = _derivatives(t + dt, state + dt * k3, p, sc, meals)
+        state = state + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+        state[0] = float(np.clip(state[0], 30, 500))              # physiological
+guard rails
+        state[3] = max(state[3], 0.0)
+traj.append(state[0])
+    minutes = np.arange(0, SIM_MINUTES + 1)
+    keep = minutes % OUT_STEP_MIN == 0
+    return pd.DataFrame({"minute": minutes[keep], "glucose": np.array(traj)[keep]})
+# -----------------------------------------------------------------------------------
+---
+# Explainable AI: counterfactual attribution
+# -----------------------------------------------------------------------------------
+---
+def _largest_effect(diff: np.ndarray, minutes: np.ndarray) -> Tuple[float, int]:
+    """Signed value and minute of the largest-magnitude difference between two
+curves."""
+    k = int(np.argmax(np.abs(diff)))
+    return float(diff[k]), int(minutes[k])
+def explain(g0: float, p: TwinParams, sc: ScenarioInputs, meals: List[Tuple[float,
+float]],
+            sim: pd.DataFrame) -> Tuple[List[str], List[Tuple[str, str]]]:
+    """
+    Leave-one-out counterfactuals: re-run the twin with each factor neutralised and
+report
+    the glucose difference. Returns (explanations, alerts[(level, text)]).
+    """
+    m = sim["minute"].to_numpy()
+    G = sim["glucose"].to_numpy()
+    no_carbs = simulate(g0, p, replace(sc, carbs_g=0.0), meals)["glucose"].to_numpy()
+    no_ex = simulate(g0, p, replace(sc, exercise_min=0.0), meals)
+["glucose"].to_numpy()
+    flipped = simulate(g0, p, replace(sc, dose_taken=not sc.dose_taken), meals)
+["glucose"].to_numpy()
+    notes: List[str] = []
+    peak, t_peak = float(G.max()), int(m[int(np.argmax(G))])
+    if sc.carbs_g > 0:
+        eff, t = _largest_effect(G - no_carbs, m)
+        notes.append(f"️ **{sc.carbs_g:.0f} g carbohydrate** raises glucose by up to
+**+{eff:.0f} mg/dL** "
+                     f"(around +{t} min), following a gut-absorption curve that peaks
+near "
+                     f"{p.t_max:.0f} min.")
+    met_now = drug_activity(sc.hours_since_dose * 60 + SIM_MINUTES / 2, p.met_ka,
+p.met_ke)
+    if sc.exercise_min > 0:
+        eff, t = _largest_effect(G - no_ex, m)
+        text = (f"🏃 **{sc.exercise_min:.0f} min of exercise** lowers glucose by up
+to **{abs(eff):.0f} mg/dL** "
+                f"(around +{t} min) through insulin-independent muscle uptake plus a
+lingering "
+                f"insulin-sensitivity boost.")
+        if sc.carbs_g > 0:
+            mitigated = abs(eff)
+            if mitigated > 1:
+                text += (f" The post-meal spike is **mitigated by {mitigated:.0f}
+mg/dL**")
+                if sc.dose_taken and met_now >= 0.6:
+                    text += (f", with the activity window overlapping Metformin's
+active phase "
+                             f"(~{met_now:.0%} of peak action).")
+                else:
+                    text += "."
+        notes.append(text)
+    eff, t = _largest_effect(G - flipped, m)
+    if sc.dose_taken:
+        notes.append(f"💊 The **on-schedule dose** (Metformin 1000 mg + Empagliflozin
+10 mg) protects about "
+                     f"**{abs(eff):.0f} mg/dL** compared with skipping it; Metformin
+is at "
+                     f"~{met_now:.0%} of peak action mid-forecast.")
+    else:
+        notes.append(f"⚠️ The **skipped dose** removes glucose-lowering action (less
+hepatic suppression and "
+                     f"less urinary glucose excretion), adding up to **+
+{abs(eff):.0f} mg/dL** by "
+                     f"+{t} min.")
+    if not notes[:-1] and sc.dose_taken:
+        notes.insert(0, "No carbohydrate or exercise is applied, so the curve simply
+relaxes toward your "
+                        f"medicated fasting baseline (~{p.Gb:.0f} mg/dL).")
+    alerts: List[Tuple[str, str]] = []
+    nadir, t_nadir = float(G.min()), int(m[int(np.argmin(G))])
+    if nadir < TIR_LOW:
+        alerts.append(("error", f"Hypoglycaemia risk: predicted low of {nadir:.0f}
+mg/dL at +{t_nadir} min. "
+                                f"Follow the patient's hypoglycaemia action plan and
+review with the care team."))
+    if peak > 250:
+        alerts.append(("warning", f"Marked hyperglycaemia: predicted peak {peak:.0f}
+mg/dL at +{t_peak} min."))
+    if not alerts and peak <= TIR_HIGH:
+        alerts.append(("success", f"Predicted range {nadir:.0f}-{peak:.0f} mg/dL
+stays inside the "
+                                  f"{TIR_LOW:.0f}-{TIR_HIGH:.0f} target band."))
+elif not alerts:
+        alerts.append(("info", f"Predicted range {nadir:.0f}-{peak:.0f} mg/dL: no
+critical excursion, but "
+                               f"glucose runs above the {TIR_HIGH:.0f} mg/dL target
+band."))
+    return notes, alerts
+# -----------------------------------------------------------------------------------
+---
+# 4. DASHBOARD UI
+# -----------------------------------------------------------------------------------
+---
+def build_chart(clean: pd.DataFrame, sim: pd.DataFrame, baseline: pd.DataFrame, now:
+pd.Timestamp) -> alt.Chart:
+    """Layered Altair chart: target band, actual 24 h curve, simulated future, no-
+action baseline."""
+    actual = pd.DataFrame({"time": clean["timestamp"], "glucose": clean["glucose"],
+"series": "Actual (last 24 h)"})
+    future = pd.DataFrame({"time": now + pd.to_timedelta(sim["minute"], unit="m"),
+                           "glucose": sim["glucose"], "series": "Simulated (next 2
+h)"})
+    base = pd.DataFrame({"time": now + pd.to_timedelta(baseline["minute"], unit="m"),
+                         "glucose": baseline["glucose"], "series": "No-action
+baseline"})
+    data = pd.concat([actual, future, base], ignore_index=True)
+    domain = ["Actual (last 24 h)", "Simulated (next 2 h)", "No-action baseline"]
+    y_max = max(300.0, float(data["glucose"].max()) + 20)
+    lines = alt.Chart(data).mark_line(strokeWidth=2.5).encode(
+        x=alt.X("time:T", title="Time"),
+        y=alt.Y("glucose:Q", title="Glucose (mg/dL)", scale=alt.Scale(domain=[40,
+y_max])),
+        color=alt.Color("series:N", sort=domain, legend=alt.Legend(title=None,
+orient="top"),
+                        scale=alt.Scale(domain=domain, range=["#2563eb", "#e11d48",
+"#6b7280"])),
+        strokeDash=alt.StrokeDash("series:N", legend=None,
+                                  scale=alt.Scale(domain=domain, range=[[1, 0], [1,
+0], [6, 4]])),
+        tooltip=[alt.Tooltip("time:T", title="Time"), alt.Tooltip("series:N",
+title="Series"),
+                 alt.Tooltip("glucose:Q", title="mg/dL", format=".0f")],
+    )
+    band = alt.Chart(pd.DataFrame({"lo": [TIR_LOW], "hi": [TIR_HIGH]})).mark_rect(
+        opacity=0.12, color="#16a34a").encode(y="lo:Q", y2="hi:Q")
+    now_rule = alt.Chart(pd.DataFrame({"t": [now]})).mark_rule(strokeDash=[3, 3],
+color="#9ca3af").encode(x="t:T")
+    imputed = clean[clean["glucose_imputed"]]
+    dots = alt.Chart(imputed).mark_point(color="#f59e0b", filled=True,
+size=45).encode(
+        x="timestamp:T", y="glucose:Q",
+        tooltip=[alt.Tooltip("timestamp:T", title="Imputed sample"),
+alt.Tooltip("glucose:Q", format=".0f")])
+    return (band + lines + dots +
+now_rule).properties(height=380).interactive(bind_y=False)
+def main() -> None:
+    st.set_page_config(page_title="Diabetes Digital Twin", page_icon="🩺",
+layout="wide")
+    st.title("🩺 Diabetes Digital Twin Sandbox")
+    st.caption("EHR baseline + wearable stream → physiological twin → 2-hour what-if
+glucose forecast. "
+               "Synthetic data, illustrative parameters; not for clinical use.")
+    # ---------------- Sidebar: patient context and what-if inputs ----------------
+    with st.sidebar:
+        st.header("Patient (EHR baseline)")
+        st.markdown(f"**Age:** {EHR_BASELINE['age']}  \n**Baseline HbA1c:**
+{EHR_BASELINE['baseline_hba1c']}%  \n"
+                    f"**Est. average glucose:** {28.7 *
+EHR_BASELINE['baseline_hba1c'] - 46.7:.0f} mg/dL")
+        st.dataframe(pd.DataFrame(EHR_BASELINE["medications"]), hide_index=True,
+use_container_width=True)
+        st.header("What-if inputs")
+        carbs = st.slider("Carbohydrate intake now (g)", 0, 150, 45, step=5)
+        exercise = st.slider("Exercise duration starting now (min)", 0, 90, 30,
+step=5)
+        dose_taken = st.toggle("Medication dose taken on schedule", value=True,
+                               help="Off = the scheduled Metformin + Empagliflozin
+dose is skipped.")
+        hours_since = st.slider("Hours since last scheduled dose", 0.0, 10.0, 2.0,
+step=0.5)
+        st.header("Data engine")
+        seed = st.number_input("Random seed", min_value=0, max_value=9999, value=42,
+step=1)
+        dropout = st.slider("Sensor dropout rate", 0.0, 0.25, 0.06, step=0.01)
+    # ---------------- Data -> preprocessing -> twin ----------------
+    anchor = pd.Timestamp.now().floor(f"{SAMPLE_MIN}min").isoformat()
+    raw = generate_synthetic_data(int(seed), float(dropout), anchor)
+    clean, scalers = preprocess(raw)
+    params = estimate_params(clean)
+    meals = recent_meals(clean)
+    now = clean["timestamp"].iloc[-1]
+    g0 = float(clean["glucose"].iloc[-1])
+slope, arrow, trend_label = glucose_trend(clean)
+    scenario = ScenarioInputs(float(carbs), float(exercise), bool(dose_taken),
+float(hours_since))
+    baseline_inputs = ScenarioInputs(0.0, 0.0, True, float(hours_since))
+    sim = simulate(g0, params, scenario, meals)
+    baseline = simulate(g0, params, baseline_inputs, meals)
+    tir_sim = time_in_range(sim["glucose"])
+    tir_base = time_in_range(baseline["glucose"])
+    tir_24h = time_in_range(clean["glucose"])
+    g120 = float(sim["glucose"].iloc[-1])
+    g120_base = float(baseline["glucose"].iloc[-1])
+    # ---------------- Metric cards ----------------
+    c1, c2, c3, c4 = st.columns(4)
+    with c1, st.container(border=True):
+        st.metric("Current glucose", f"{g0:.0f} mg/dL", f"{slope:+.1f} mg/dL/min",
+delta_color="inverse")
+    with c2, st.container(border=True):
+        st.metric("Trend", f"{arrow}  {trend_label}", help="Linear fit over the last
+45 minutes of CGM.")
+    with c3, st.container(border=True):
+        st.metric("Simulated TIR (next 2 h)", f"{tir_sim:.0f}%", f"{tir_sim -
+tir_base:+.0f} pts vs no-action",
+                  help=f"Share of forecast time in {TIR_LOW:.0f}-{TIR_HIGH:.0f}
+mg/dL. Last 24 h actual TIR: {tir_24h:.0f}%.")
+    with c4, st.container(border=True):
+        st.metric("Predicted glucose at +2 h", f"{g120:.0f} mg/dL", f"{g120 -
+g120_base:+.0f} vs no-action",
+                  delta_color="inverse")
+    # ---------------- Chart ----------------
+    st.subheader("Actual 24 h glucose vs 2 h simulated trajectory")
+    st.altair_chart(build_chart(clean, sim, baseline, now), use_container_width=True)
+    n_imp = int(clean["glucose_imputed"].sum())
+    st.caption(f"Green band = {TIR_LOW:.0f}-{TIR_HIGH:.0f} mg/dL target. Orange dots
+= {n_imp} CGM samples "
+               f"reconstructed by interpolation after sensor dropout.")
+    f1, f2, f3 = st.columns(3)
+    for col, minute in zip((f1, f2, f3), (30, 60, 120)):
+        value = float(sim.loc[sim["minute"] == minute, "glucose"].iloc[0])
+        col.metric(f"Forecast +{minute} min", f"{value:.0f} mg/dL")
+    # ---------------- XAI panel ----------------
+    st.subheader("🔍 Explainable AI: why the curve moved")
+    notes, alerts = explain(g0, params, scenario, meals, sim)
+    for level, text in alerts:
+        getattr(st, level)(text)
+with st.container(border=True):
+        for note in notes:
+            st.markdown(note)
+        st.caption("Each effect is a counterfactual: the twin is re-run with that
+factor removed and the "
+                   "difference is reported, so every number is traceable to a model
+term.")
+    # ---------------- Transparency ----------------
+    with st.expander("Data pipeline and model details"):
+        st.markdown("**Cleaned wearable data (normalised features and imputation
+flags)**")
+        st.dataframe(clean[["timestamp", "glucose_raw", "glucose", "glucose_imputed",
+"steps", "carbs_g",
+                            "glucose_norm", "steps_norm", "carbs_g_norm"]].round(3),
+hide_index=True,
+                     use_container_width=True)
+        st.markdown("**Personalised twin parameters**")
+        st.json({k: round(v, 5) if isinstance(v, float) else v for k, v in
+params.__dict__.items()})
+        st.markdown("**Model**  \n"
+                    "`dG/dt = -p1(G-Gb) - xG + Ra/Vg - exercise - drug effects`  \n"
+                    "`dx/dt = -p2 x + p3 S i`  ·  `di/dt = -n i + γ·max(G-Gb, 0)`  · 
+`dE/dt = u_ex - E/τ`")
+    st.caption("Research prototype using synthetic data. Outputs are decision-support
+illustrations and must "
+               "not be used to dose insulin or change therapy.")
+if __name__ == "__main__":
+    main()
+
